@@ -1,7 +1,0 @@
-fastmcp
-httpx
-
-[test]
-pytest
-pytest-asyncio
-respx

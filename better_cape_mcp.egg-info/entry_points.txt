@@ -1,2 +1,0 @@
-[console_scripts]
-cape-mcp = better_cape_mcp.server:main
