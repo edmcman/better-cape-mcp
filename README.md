@@ -4,6 +4,7 @@ Standalone MCP server for CAPEv2. Talks to the CAPE REST API over HTTP — no ne
 
 ## Install
 
+### pip
 ```sh
 cd better-cape-mcp
 pip install -e .
@@ -13,6 +14,18 @@ Or run directly:
 ```sh
 pip install fastmcp httpx
 python -m better_cape_mcp.server
+```
+
+### uv / uvx (recommended)
+```sh
+# Run directly from GitHub without installing
+CAPE_API_URL=http://192.168.56.1:8000/apiv2 \
+CAPE_API_TOKEN=your_token \
+uvx --from git+https://github.com/edmcman/better-cape-mcp.git cape-mcp
+
+# Or install locally for development
+uv pip install -e .
+uv run cape-mcp
 ```
 
 ## Environment variables
@@ -46,6 +59,23 @@ python -m better_cape_mcp.server --transport sse --host 0.0.0.0 --port 9004
 
 Add to `claude_desktop_config.json`:
 
+### With uvx (no local install)
+```json
+{
+  "mcpServers": {
+    "cape": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/edmcman/better-cape-mcp.git", "cape-mcp"],
+      "env": {
+        "CAPE_API_URL": "http://192.168.56.1:8000/apiv2",
+        "CAPE_API_TOKEN": "your_token"
+      }
+    }
+  }
+}
+```
+
+### With pip
 ```json
 {
   "mcpServers": {
