@@ -41,6 +41,29 @@ uv run cape-mcp
 | `CAPE_MCP_HOST` | `127.0.0.1` | Bind host for HTTP/SSE |
 | `CAPE_MCP_PORT` | `9004` | Bind port for HTTP/SSE |
 
+## Error behavior
+
+Transport failures, HTTP error responses, invalid local paths, and filesystem
+failures are reported as native MCP tool errors. Diagnostics identify the CAPE
+operation and failure type; timeout errors remain descriptive even when HTTPX
+provides an empty exception message. The server does not retry requests because
+retrying a submission could create duplicate CAPE tasks.
+
+CAPE application responses returned with HTTP 200 are preserved as JSON. In
+particular, both `"error": false` and CAPE's `"error": []` convention mean the
+request succeeded. Application results such as an unavailable extracted config
+remain ordinary CAPE responses rather than MCP transport errors.
+
+`verify_auth` reports `authenticated: false` only when CAPE returns HTTP 401 or
+403, or when `CAPE_MCP_AUTH_REQUIRED` is enabled without a token. Connectivity,
+DNS, timeout, and server failures are MCP errors instead of authentication
+failures. When CAPE accepts a request without a token, `verify_auth` identifies
+the connection as anonymous access.
+
+HTTP timeouts use HTTPX's defaults. If a `.local` CAPE hostname resolves
+unreliably in the MCP server's environment, configure `CAPE_API_URL` with a
+stable DNS name, IP address, or host mapping.
+
 ## Usage
 
 ### stdio (default — for Claude Desktop, etc.)
@@ -96,4 +119,4 @@ Add to `claude_desktop_config.json`:
 - No imports from `lib.cuckoo.common.*`
 - `api.conf` settings replaced by environment variables
 - Search term maps (`search_term_map`, `perform_search_filters`, etc.) inlined as constants
-- All tool behaviour and JSON shapes are identical
+- Successful CAPE response shapes are preserved; request failures use native MCP tool errors

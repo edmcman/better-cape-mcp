@@ -9,6 +9,7 @@ from typing import Any, Dict
 try:
     import httpx
     from fastmcp import FastMCP
+    from fastmcp.exceptions import ToolError
 except ImportError:
     sys.exit("pip install fastmcp httpx")
 
@@ -178,6 +179,8 @@ if _ENABLED_TOOLS_RAW:
 
 ALLOWED_SUBMISSION_DIR = os.environ.get("CAPE_ALLOWED_SUBMISSION_DIR", os.getcwd())
 
+ERROR_BODY_LIMIT = 2000
+
 if AUTH_REQUIRED and not API_TOKEN:
     print(
         "WARNING: Token authentication is enabled, but CAPE_API_TOKEN is not set.",
@@ -218,29 +221,124 @@ def get_headers(token: str = "") -> Dict[str, str]:
     return headers
 
 
+class CapeAPIError(ToolError):
+    """An actionable failure while communicating with the CAPE API."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str,
+        method: str,
+        endpoint: str,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.method = method
+        self.endpoint = endpoint
+        self.status_code = status_code
+
+
+def _exception_detail(exc: BaseException) -> str:
+    """Return useful text even for exceptions whose string form is empty."""
+    return str(exc).strip() or repr(exc) or type(exc).__name__
+
+
+def _response_excerpt(response: httpx.Response) -> str:
+    """Return a bounded diagnostic excerpt from an HTTP error response."""
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        detail = response.text.strip()
+    else:
+        if isinstance(payload, dict):
+            detail = ""
+            for key in ("error_value", "message", "detail", "error"):
+                value = payload.get(key)
+                if value not in (None, "", [], {}):
+                    detail = str(value)
+                    break
+            if not detail:
+                detail = json.dumps(payload, default=str)
+        else:
+            detail = json.dumps(payload, default=str)
+    return (detail or "<empty response body>")[:ERROR_BODY_LIMIT]
+
+
+def _http_error(response: httpx.Response, method: str, endpoint: str) -> CapeAPIError:
+    return CapeAPIError(
+        f"CAPE API {method.upper()} {endpoint} returned HTTP "
+        f"{response.status_code}: {_response_excerpt(response)}",
+        kind="http_status",
+        method=method.upper(),
+        endpoint=endpoint,
+        status_code=response.status_code,
+    )
+
+
+def _request_error(exc: BaseException, method: str, endpoint: str) -> CapeAPIError:
+    if isinstance(exc, httpx.TimeoutException):
+        message = (
+            f"CAPE API {method.upper()} {endpoint} timed out "
+            f"({type(exc).__name__})"
+        )
+        kind = "timeout"
+    elif isinstance(exc, httpx.RequestError):
+        message = (
+            f"CAPE API {method.upper()} {endpoint} request failed: "
+            f"{type(exc).__name__}: {_exception_detail(exc)}"
+        )
+        kind = "transport"
+    else:
+        message = (
+            f"CAPE API {method.upper()} {endpoint} failed: "
+            f"{type(exc).__name__}: {_exception_detail(exc)}"
+        )
+        kind = "unexpected"
+    return CapeAPIError(
+        message,
+        kind=kind,
+        method=method.upper(),
+        endpoint=endpoint,
+    )
+
+
+def _require_token(token: str, method: str, endpoint: str) -> None:
+    if is_auth_required() and not (token or API_TOKEN):
+        raise CapeAPIError(
+            "Authentication is required but no CAPE API token was provided.",
+            kind="authentication_required",
+            method=method.upper(),
+            endpoint=endpoint,
+        )
+
+
+def _cape_response_failed(result: Any) -> bool:
+    """Interpret both CAPE's false and empty-list success conventions."""
+    return isinstance(result, dict) and bool(result.get("error", False))
+
+
 async def _request(method: str, endpoint: str, token: str = "", **kwargs) -> Any:
-    if is_auth_required():
-        auth_token = token if token else API_TOKEN
-        if not auth_token:
-            return {"error": True, "message": "Authentication required but no token provided."}
+    _require_token(token, method, endpoint)
 
     url = f"{API_URL.rstrip('/')}/{endpoint.lstrip('/')}"
-    async with httpx.AsyncClient() as client:
-        try:
+    try:
+        async with httpx.AsyncClient() as client:
             response = await client.request(method, url, headers=get_headers(token), **kwargs)
-            if response.status_code >= 400:
-                try:
-                    return response.json()
-                except json.JSONDecodeError:
-                    return {"error": True, "message": f"HTTP {response.status_code}", "body": response.text}
-            try:
-                return response.json()
-            except json.JSONDecodeError:
-                return {"error": False, "data": response.text}
-        except httpx.HTTPStatusError as e:
-            return {"error": True, "message": str(e), "body": e.response.text}
-        except Exception as e:
-            return {"error": True, "message": str(e)}
+    except httpx.TimeoutException as exc:
+        raise _request_error(exc, method, endpoint) from exc
+    except httpx.RequestError as exc:
+        raise _request_error(exc, method, endpoint) from exc
+    except Exception as exc:
+        raise _request_error(exc, method, endpoint) from exc
+
+    if response.status_code >= 400:
+        raise _http_error(response, method, endpoint)
+    try:
+        return response.json()
+    except json.JSONDecodeError:
+        return {"error": False, "data": response.text}
 
 
 async def _download_file(
@@ -249,36 +347,26 @@ async def _download_file(
     default_filename: str = "downloaded_file.bin",
     token: str = "",
 ) -> str:
-    if is_auth_required():
-        auth_token = token if token else API_TOKEN
-        if not auth_token:
-            return json.dumps(
-                {"error": True, "message": "Authentication required but no token provided."},
-                indent=2,
-            )
+    method = "GET"
+    _require_token(token, method, endpoint)
 
     if not os.path.isdir(destination):
-        return json.dumps(
-            {"error": True, "message": "Destination directory does not exist"},
-            indent=2,
+        raise CapeAPIError(
+            f"Download destination directory does not exist: {destination}",
+            kind="filesystem",
+            method=method,
+            endpoint=endpoint,
         )
 
     url = f"{API_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     headers = get_headers(token)
 
-    async with httpx.AsyncClient() as client:
-        try:
+    try:
+        async with httpx.AsyncClient() as client:
             async with client.stream("GET", url, headers=headers) as response:
                 if response.status_code != 200:
-                    content = await response.read()
-                    return json.dumps(
-                        {
-                            "error": True,
-                            "message": f"HTTP {response.status_code}",
-                            "body": content.decode("utf-8", errors="ignore"),
-                        },
-                        indent=2,
-                    )
+                    await response.aread()
+                    raise _http_error(response, method, endpoint)
 
                 filename = default_filename
                 content_disposition = response.headers.get("content-disposition")
@@ -296,8 +384,22 @@ async def _download_file(
                     {"error": False, "message": f"Saved to {filepath}", "path": filepath},
                     indent=2,
                 )
-        except Exception as e:
-            return json.dumps({"error": True, "message": str(e)}, indent=2)
+    except CapeAPIError:
+        raise
+    except httpx.TimeoutException as exc:
+        raise _request_error(exc, method, endpoint) from exc
+    except httpx.RequestError as exc:
+        raise _request_error(exc, method, endpoint) from exc
+    except OSError as exc:
+        raise CapeAPIError(
+            f"Failed to save CAPE download in {destination}: "
+            f"{type(exc).__name__}: {_exception_detail(exc)}",
+            kind="filesystem",
+            method=method,
+            endpoint=endpoint,
+        ) from exc
+    except Exception as exc:
+        raise _request_error(exc, method, endpoint) from exc
 
 
 def _build_submission_data(**kwargs) -> Dict[str, str]:
@@ -314,56 +416,103 @@ def _build_submission_data(**kwargs) -> Dict[str, str]:
     return data
 
 
+def _validate_submission_file(file_path: str, endpoint: str) -> str:
+    """Validate and resolve a file inside the configured submission directory."""
+    if not os.path.isfile(file_path):
+        raise CapeAPIError(
+            f"Submission file does not exist or is not a regular file: {file_path}",
+            kind="filesystem",
+            method="POST",
+            endpoint=endpoint,
+        )
+
+    resolved_file = os.path.realpath(file_path)
+    resolved_allowed_dir = os.path.realpath(ALLOWED_SUBMISSION_DIR)
+    try:
+        inside_allowed_dir = os.path.commonpath(
+            (resolved_file, resolved_allowed_dir)
+        ) == resolved_allowed_dir
+    except ValueError:
+        inside_allowed_dir = False
+    if not inside_allowed_dir:
+        raise CapeAPIError(
+            f"File submission is restricted to {resolved_allowed_dir}: {file_path}",
+            kind="validation",
+            method="POST",
+            endpoint=endpoint,
+        )
+    return resolved_file
+
+
+def _mapping(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _sequence(value: Any) -> list:
+    return value if isinstance(value, list) else []
+
+
 def get_lean_cape_report(raw_cape_json: dict) -> dict:
+    info = _mapping(raw_cape_json.get("info"))
+    detections = _mapping(raw_cape_json.get("detections"))
+    network = _mapping(raw_cape_json.get("network"))
+    behavior = _mapping(raw_cape_json.get("behavior"))
+    behavior_summary = _mapping(behavior.get("summary"))
     return {
-        "score": raw_cape_json.get("info", {}).get("score", 0),
+        "score": info.get("score", 0),
         "family": raw_cape_json.get("malfamily")
-        or raw_cape_json.get("detections", {}).get("family")
+        or detections.get("family")
         or "Unknown",
-        "extracted_configs": raw_cape_json.get("CAPE", []),
+        "extracted_configs": _sequence(raw_cape_json.get("CAPE")),
         "high_severity_signatures": [
-            {"name": sig["name"], "desc": sig["description"]}
-            for sig in raw_cape_json.get("signatures", [])
+            {"name": sig.get("name", ""), "desc": sig.get("description", "")}
+            for sig in _sequence(raw_cape_json.get("signatures"))
             if isinstance(sig, dict) and sig.get("severity", 0) >= 3
         ],
         "network": {
             "domains": (
-                [d["domain"] for d in raw_cape_json.get("network", {}).get("domains", [])]
-                if isinstance(raw_cape_json.get("network", {}).get("domains"), list)
+                [
+                    domain["domain"]
+                    for domain in network.get("domains", [])
+                    if isinstance(domain, dict) and "domain" in domain
+                ]
+                if isinstance(network.get("domains"), list)
                 else []
             ),
             "http_uris": (
-                [h["uri"] for h in raw_cape_json.get("network", {}).get("http", [])]
-                if isinstance(raw_cape_json.get("network", {}).get("http"), list)
+                [
+                    request["uri"]
+                    for request in network.get("http", [])
+                    if isinstance(request, dict) and "uri" in request
+                ]
+                if isinstance(network.get("http"), list)
                 else []
             ),
         },
         "indicators": {
-            "mutexes": (
-                raw_cape_json.get("behavior", {}).get("summary", {}).get("mutexes", [])
-                if isinstance(raw_cape_json.get("behavior", {}).get("summary"), dict)
-                else []
-            ),
-            "commands": (
-                raw_cape_json.get("behavior", {}).get("summary", {}).get("executed_commands", [])
-                if isinstance(raw_cape_json.get("behavior", {}).get("summary"), dict)
-                else []
-            ),
+            "mutexes": _sequence(behavior_summary.get("mutexes")),
+            "commands": _sequence(behavior_summary.get("executed_commands")),
         },
     }
 
 
+def _lean_if_report(value: Any) -> Any:
+    if isinstance(value, dict) and isinstance(value.get("info"), dict):
+        return get_lean_cape_report(value)
+    return value
+
+
 def _apply_lean_report(result: Any) -> Any:
     if isinstance(result, dict):
-        if result.get("error") is False and "data" in result:
+        if not _cape_response_failed(result) and "data" in result:
             if isinstance(result["data"], list):
-                result["data"] = [get_lean_cape_report(item) for item in result["data"]]
+                result["data"] = [_lean_if_report(item) for item in result["data"]]
             elif isinstance(result["data"], dict):
-                result["data"] = get_lean_cape_report(result["data"])
-        elif "info" in result:
-            return get_lean_cape_report(result)
+                result["data"] = _lean_if_report(result["data"])
+        elif isinstance(result.get("info"), dict):
+            return _lean_if_report(result)
     elif isinstance(result, list):
-        return [get_lean_cape_report(item) for item in result]
+        return [_lean_if_report(item) for item in result]
     return result
 
 
@@ -394,30 +543,12 @@ async def submit_file(
     token: str = "",
 ) -> str:
     """Submit a local file for analysis."""
-    if is_auth_required():
-        auth_token = token if token else API_TOKEN
-        if not auth_token:
-            return json.dumps(
-                {"error": True, "message": "Authentication required but no token provided."},
-                indent=2,
-            )
+    endpoint = "tasks/create/file/"
+    _require_token(token, "POST", endpoint)
+    resolved_file = _validate_submission_file(file_path, endpoint)
 
-    if not os.path.exists(file_path):
-        return json.dumps({"error": True, "message": "File not found"}, indent=2)
-
-    abs_file_path = os.path.abspath(file_path)
-    abs_allowed_dir = os.path.abspath(ALLOWED_SUBMISSION_DIR)
-    if not abs_file_path.startswith(abs_allowed_dir):
-        return json.dumps(
-            {
-                "error": True,
-                "message": f"Security Violation: File submission is restricted to {abs_allowed_dir}",
-            },
-            indent=2,
-        )
-
-    filename = os.path.basename(file_path)
-    mime_type, _ = mimetypes.guess_type(file_path)
+    filename = os.path.basename(resolved_file)
+    mime_type, _ = mimetypes.guess_type(resolved_file)
     if not mime_type:
         mime_type = "application/octet-stream"
 
@@ -435,18 +566,22 @@ async def submit_file(
         custom=custom,
     )
 
-    url = f"{API_URL.rstrip('/')}/tasks/create/file/"
-    async with httpx.AsyncClient() as client:
-        try:
-            with open(file_path, "rb") as f:
-                files = {"file": (filename, f, mime_type)}
-                response = await client.post(url, data=data, files=files, headers=get_headers(token))
-                try:
-                    result = response.json()
-                except json.JSONDecodeError:
-                    result = {"error": response.status_code >= 400, "data": response.text}
-        except Exception as e:
-            result = {"error": True, "message": str(e)}
+    try:
+        with open(resolved_file, "rb") as file_handle:
+            files = {"file": (filename, file_handle, mime_type)}
+            result = await _request(
+                "POST", endpoint, token=token, data=data, files=files
+            )
+    except CapeAPIError:
+        raise
+    except OSError as exc:
+        raise CapeAPIError(
+            f"Failed to read submission file {resolved_file}: "
+            f"{type(exc).__name__}: {_exception_detail(exc)}",
+            kind="filesystem",
+            method="POST",
+            endpoint=endpoint,
+        ) from exc
 
     return json.dumps(result, indent=2)
 
@@ -521,47 +656,32 @@ async def submit_static(
     token: str = "",
 ) -> str:
     """Submit a file for static extraction only."""
-    if is_auth_required():
-        auth_token = token if token else API_TOKEN
-        if not auth_token:
-            return json.dumps(
-                {"error": True, "message": "Authentication required but no token provided."},
-                indent=2,
-            )
+    endpoint = "tasks/create/static/"
+    _require_token(token, "POST", endpoint)
+    resolved_file = _validate_submission_file(file_path, endpoint)
 
-    if not os.path.exists(file_path):
-        return json.dumps({"error": True, "message": "File not found"}, indent=2)
-
-    abs_file_path = os.path.abspath(file_path)
-    abs_allowed_dir = os.path.abspath(ALLOWED_SUBMISSION_DIR)
-    if not abs_file_path.startswith(abs_allowed_dir):
-        return json.dumps(
-            {
-                "error": True,
-                "message": f"Security Violation: File submission is restricted to {abs_allowed_dir}",
-            },
-            indent=2,
-        )
-
-    filename = os.path.basename(file_path)
-    mime_type, _ = mimetypes.guess_type(file_path)
+    filename = os.path.basename(resolved_file)
+    mime_type, _ = mimetypes.guess_type(resolved_file)
     if not mime_type:
         mime_type = "application/octet-stream"
 
     data = _build_submission_data(priority=priority, options=options)
-    url = f"{API_URL.rstrip('/')}/tasks/create/static/"
-
-    async with httpx.AsyncClient() as client:
-        try:
-            with open(file_path, "rb") as f:
-                files = {"file": (filename, f, mime_type)}
-                response = await client.post(url, data=data, files=files, headers=get_headers(token))
-                try:
-                    result = response.json()
-                except json.JSONDecodeError:
-                    result = {"error": response.status_code >= 400, "data": response.text}
-        except Exception as e:
-            result = {"error": True, "message": str(e)}
+    try:
+        with open(resolved_file, "rb") as file_handle:
+            files = {"file": (filename, file_handle, mime_type)}
+            result = await _request(
+                "POST", endpoint, token=token, data=data, files=files
+            )
+    except CapeAPIError:
+        raise
+    except OSError as exc:
+        raise CapeAPIError(
+            f"Failed to read submission file {resolved_file}: "
+            f"{type(exc).__name__}: {_exception_detail(exc)}",
+            kind="filesystem",
+            method="POST",
+            endpoint=endpoint,
+        ) from exc
 
     return json.dumps(result, indent=2)
 
@@ -914,14 +1034,40 @@ async def verify_auth(token: str = "") -> str:
     Verify if the provided API token is valid.
     Useful for checking authentication status before performing other operations.
     """
-    result = await _request("GET", "cuckoo/status/", token=token)
-    if isinstance(result, dict) and result.get("error"):
-        return json.dumps(
-            {"authenticated": False, "message": "Invalid token or authentication failed.", "details": result},
-            indent=2,
+    endpoint = "cuckoo/status/"
+    try:
+        result = await _request("GET", endpoint, token=token)
+    except CapeAPIError as exc:
+        if exc.kind == "authentication_required" or exc.status_code in (401, 403):
+            return json.dumps(
+                {
+                    "authenticated": False,
+                    "message": "CAPE API authentication was rejected.",
+                    "status_code": exc.status_code,
+                },
+                indent=2,
+            )
+        raise
+
+    if _cape_response_failed(result):
+        detail = json.dumps(result, default=str)[:ERROR_BODY_LIMIT]
+        raise CapeAPIError(
+            f"CAPE API GET {endpoint} returned an application error: {detail}",
+            kind="api_response",
+            method="GET",
+            endpoint=endpoint,
         )
+
+    auth_token = token or API_TOKEN
+    if auth_token:
+        message = "CAPE API accepted the supplied token."
+        user = "Authenticated User"
+    else:
+        message = "CAPE API is reachable without a token; authentication may be disabled."
+        user = "Anonymous access"
+
     return json.dumps(
-        {"authenticated": True, "message": "Token is valid.", "user": "Authenticated User"},
+        {"authenticated": True, "message": message, "user": user},
         indent=2,
     )
 

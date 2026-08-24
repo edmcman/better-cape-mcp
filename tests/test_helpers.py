@@ -74,6 +74,23 @@ class TestLeanCapeReport:
         assert indicators["mutexes"] == []
         assert indicators["commands"] == []
 
+    def test_handles_explicit_null_sections(self):
+        raw = {
+            "info": None,
+            "detections": None,
+            "CAPE": None,
+            "signatures": None,
+            "network": None,
+            "behavior": None,
+        }
+        lean = srv.get_lean_cape_report(raw)
+        assert lean["score"] == 0
+        assert lean["family"] == "Unknown"
+        assert lean["extracted_configs"] == []
+        assert lean["high_severity_signatures"] == []
+        assert lean["network"] == {"domains": [], "http_uris": []}
+        assert lean["indicators"] == {"mutexes": [], "commands": []}
+
 
 class TestApplyLeanReport:
     def test_dict_error_false_with_list_data(self):
@@ -88,6 +105,18 @@ class TestApplyLeanReport:
         )
         assert result["data"]["family"] == "Y"
 
+    def test_empty_error_list_is_success(self):
+        result = srv._apply_lean_report(
+            {"error": [], "data": [{"info": {"score": 5}, "malfamily": "X"}]}
+        )
+        assert result["error"] == []
+        assert result["data"][0]["family"] == "X"
+
+    def test_task_search_records_are_preserved(self):
+        task = {"id": 5, "target": "cmd.exe", "status": "reported"}
+        result = srv._apply_lean_report({"error": [], "data": [task]})
+        assert result == {"error": [], "data": [task]}
+
     def test_dict_with_info_key_direct(self):
         result = srv._apply_lean_report({"info": {"score": 3}, "malfamily": "Z"})
         assert result["family"] == "Z"
@@ -99,6 +128,16 @@ class TestApplyLeanReport:
     def test_error_dict_passthrough(self):
         err = {"error": True, "message": "boom"}
         assert srv._apply_lean_report(err) == err
+
+    def test_populated_error_list_passthrough(self):
+        err = {"error": ["boom"], "data": [{"info": {"score": 1}}]}
+        assert srv._apply_lean_report(err) == err
+
+    def test_missing_error_field_is_success(self):
+        result = srv._apply_lean_report(
+            {"data": [{"info": {"score": 1}, "malfamily": "A"}]}
+        )
+        assert result["data"][0]["family"] == "A"
 
     def test_non_dict_passthrough(self):
         assert srv._apply_lean_report("hello") == "hello"

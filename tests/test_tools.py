@@ -1,5 +1,9 @@
 import asyncio
+from unittest.mock import AsyncMock, patch
+
 import pytest
+from fastmcp.exceptions import ToolError
+
 import better_cape_mcp.server as srv
 
 
@@ -117,3 +121,16 @@ class TestToolSurface:
 
     def test_verify_auth_registered(self, tool_names):
         assert any(t.name == "verify_auth" for t in tool_names)
+
+
+@pytest.mark.asyncio
+async def test_cape_api_error_uses_native_tool_error_path():
+    error = srv.CapeAPIError(
+        "CAPE API GET cuckoo/status/ timed out (ReadTimeout)",
+        kind="timeout",
+        method="GET",
+        endpoint="cuckoo/status/",
+    )
+    with patch.object(srv, "_request", new=AsyncMock(side_effect=error)):
+        with pytest.raises(ToolError, match="timed out"):
+            await srv.mcp.call_tool("get_cuckoo_status", {})
