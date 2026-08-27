@@ -60,9 +60,11 @@ DNS, timeout, and server failures are MCP errors instead of authentication
 failures. When CAPE accepts a request without a token, `verify_auth` identifies
 the connection as anonymous access.
 
-HTTP timeouts use HTTPX's defaults. If a `.local` CAPE hostname resolves
-unreliably in the MCP server's environment, configure `CAPE_API_URL` with a
-stable DNS name, IP address, or host mapping.
+All CAPE API requests, including streamed downloads, use a 15-second HTTP
+timeout for connection establishment, reads, writes, and connection-pool
+acquisition. If a `.local` CAPE hostname resolves unreliably in the MCP
+server's environment, configure `CAPE_API_URL` with a stable DNS name, IP
+address, or host mapping.
 
 ## Usage
 

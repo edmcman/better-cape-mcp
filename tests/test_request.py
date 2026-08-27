@@ -12,6 +12,20 @@ def patch_api_url(monkeypatch):
 
 
 class TestRequest:
+    @pytest.mark.asyncio
+    async def test_client_uses_15_second_timeout(self):
+        client = AsyncCtxMock(
+            request=AsyncMock(return_value=Response(200, json={"ok": True}))
+        )
+
+        with patch.object(
+            srv.httpx, "AsyncClient", return_value=client
+        ) as async_client:
+            result = await srv._request("GET", "cuckoo/status/")
+
+        assert result == {"ok": True}
+        async_client.assert_called_once_with(timeout=srv.HTTPX_REQUEST_TIMEOUT)
+
     @respx.mock
     @pytest.mark.asyncio
     async def test_get_json_200(self):
@@ -245,10 +259,13 @@ class TestDownloadFile:
         )
         client = AsyncCtxMock(stream=MagicMock(return_value=stream_resp))
 
-        with patch.object(srv.httpx, "AsyncClient", return_value=client):
+        with patch.object(
+            srv.httpx, "AsyncClient", return_value=client
+        ) as async_client:
             result = await srv._download_file("tasks/get/pcap/1/", str(tmp_path), "default.pcap")
 
         data = json.loads(result)
+        async_client.assert_called_once_with(timeout=srv.HTTPX_REQUEST_TIMEOUT)
         assert data["error"] is False
         assert data["path"].endswith("dump.pcap")
         assert (tmp_path / "dump.pcap").read_bytes() == b"pcapdata"

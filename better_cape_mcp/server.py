@@ -180,6 +180,7 @@ if _ENABLED_TOOLS_RAW:
 ALLOWED_SUBMISSION_DIR = os.environ.get("CAPE_ALLOWED_SUBMISSION_DIR", os.getcwd())
 
 ERROR_BODY_LIMIT = 2000
+HTTPX_REQUEST_TIMEOUT = 15.0
 
 if AUTH_REQUIRED and not API_TOKEN:
     print(
@@ -324,7 +325,7 @@ async def _request(method: str, endpoint: str, token: str = "", **kwargs) -> Any
 
     url = f"{API_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=HTTPX_REQUEST_TIMEOUT) as client:
             response = await client.request(method, url, headers=get_headers(token), **kwargs)
     except httpx.TimeoutException as exc:
         raise _request_error(exc, method, endpoint) from exc
@@ -362,7 +363,7 @@ async def _download_file(
     headers = get_headers(token)
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=HTTPX_REQUEST_TIMEOUT) as client:
             async with client.stream("GET", url, headers=headers) as response:
                 if response.status_code != 200:
                     await response.aread()
