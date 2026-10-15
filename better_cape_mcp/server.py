@@ -338,6 +338,15 @@ async def _request(method: str, endpoint: str, token: str = "", **kwargs) -> Any
         raise _http_error(response, method, endpoint)
     try:
         return response.json()
+    except UnicodeDecodeError as exc:
+        content_type = response.headers.get("content-type", "unknown")
+        raise CapeAPIError(
+            f"CAPE API {method.upper()} {endpoint} returned a binary or "
+            f"non-UTF-8 response ({content_type}); use a download tool for binary files.",
+            kind="unexpected_content",
+            method=method.upper(),
+            endpoint=endpoint,
+        ) from exc
     except json.JSONDecodeError:
         return {"error": False, "data": response.text}
 
@@ -803,13 +812,28 @@ async def get_statistics(days: int = 7, token: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 @mcp_tool("taskreport")
-async def get_task_report(task_id: int, format: str = "json", token: str = "") -> str:
-    """Get the analysis report for a task (json, lite, maec, metadata, lean)."""
-    allowed_formats = {"json", "lite", "maec", "metadata", "lean"}
+async def get_task_report(
+    task_id: int, format: str = "json", token: str = "", destination: str = ""
+) -> str:
+    """Get a task report: json, litereport (smaller JSON), maec, metadata, or lean.
+
+    The lite format is a ZIP archive, not JSON. It is downloaded to destination
+    (an existing directory, default CAPE_ALLOWED_SUBMISSION_DIR) and returns its
+    local path. Use litereport for the smaller JSON report instead.
+    """
+    allowed_formats = {"json", "lite", "litereport", "maec", "metadata", "lean"}
     if format not in allowed_formats:
         return json.dumps(
             {"error": True, "message": f"Invalid format. Allowed: {', '.join(allowed_formats)}"},
             indent=2,
+        )
+
+    if format == "lite":
+        return await _download_file(
+            f"tasks/get/report/{task_id}/lite/",
+            destination or ALLOWED_SUBMISSION_DIR,
+            f"{task_id}_lite.zip",
+            token=token,
         )
 
     if format == "lean":
@@ -823,7 +847,24 @@ async def get_task_report(task_id: int, format: str = "json", token: str = "") -
         result = _apply_lean_report(result)
         return json.dumps(result, indent=2)
 
-    result = await _request("GET", f"tasks/get/report/{task_id}/{format}/", token=token)
+    endpoint = f"tasks/get/report/{task_id}/{format}/"
+    result = await _request("GET", endpoint, token=token)
+    if _cape_response_failed(result):
+        result = {**result, "task_id": task_id, "report_format": format, "endpoint": endpoint}
+        # CAPE uses this message when the requested file is absent, even if
+        # other reports exist in the same task's reports directory.
+        if result.get("error_value") == "Reports directory does not exist":
+            filenames = {
+                "json": "report.json", "litereport": "lite.json",
+                "maec": "report.maec-4.1.xml", "metadata": "report.metadata.xml",
+            }
+            result["cape_error"] = result["error_value"]
+            result["error_value"] = (
+                f"The {format} report for task {task_id} is not available on the "
+                f"CAPE server (reports/{filenames[format]})."
+            )
+            if format == "litereport":
+                result["error_value"] += " Try requesting format=json or format=lean instead."
     return json.dumps(result, indent=2)
 
 

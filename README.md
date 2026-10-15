@@ -68,6 +68,31 @@ address, or host mapping.
 
 ## Usage
 
+### Report formats
+
+`get_task_report` returns `json` (the full report), `litereport` (the smaller JSON
+report, if enabled in CAPE), `lean` (a search-based summary), or textual `maec`
+and `metadata` reports. CAPE's `lite` format is a ZIP archive containing analysis
+artifacts, not a smaller JSON response.
+
+For `format="lite"`, the tool streams the archive to `destination`, an existing
+local directory, and returns its `path`. If omitted, the directory defaults to
+`CAPE_ALLOWED_SUBMISSION_DIR` (or the server's working directory). The archive is
+saved as binary without JSON or UTF-8 decoding and is not extracted. For example:
+
+```json
+{"task_id": 5, "format": "lite", "destination": "/work"}
+```
+
+Use `format="litereport"` when you want JSON rather than a downloadable archive.
+
+If a report is unavailable, the tool includes the task ID, requested format,
+and endpoint. CAPE's original diagnostic is retained. In particular, CAPE's
+`Reports directory does not exist` response can mean the requested file is
+missing even when other reports exist. For `litereport`, the diagnostic names
+`reports/lite.json`, states that the requested format is not available on the
+CAPE server, and suggests trying `json`/`lean` instead.
+
 ### stdio (default — for Claude Desktop, etc.)
 ```sh
 CAPE_API_URL=http://192.168.56.1:8000/apiv2 \
